@@ -126,10 +126,22 @@ def pytest_configure(config: pytest.Config) -> None:
     #      child if it overruns, synthesizing a failure report on its
     #      behalf. That's our backstop for child crashes too.
     #
-    # Setting ``timeout = 0`` is pytest-timeout's documented "disable"
-    # sentinel; its hookwrappers become no-ops.
+    # pytest-timeout caches the resolved timeout in
+    # ``config._env_timeout`` during its own ``pytest_configure``, which
+    # may have already run by the time we get here (hook order between
+    # entry_point plugins isn't guaranteed). Setting both ``option.timeout``
+    # and the cached private attributes covers both code paths in
+    # ``pytest_timeout._get_item_settings``: it reads ``_env_timeout``
+    # first, then falls back to the option.
     if hasattr(config.option, "timeout"):
         config.option.timeout = 0
+    # ``_env_timeout`` is a private attribute but stable across
+    # pytest-timeout 2.x. Setting it to ``None`` (not 0) matches what
+    # pytest-timeout itself uses when no timeout is configured — its
+    # ``_get_item_settings`` then takes the no-timeout branch instead
+    # of treating 0 as a configured-but-disabled value.
+    config._env_timeout = None  # type: ignore[attr-defined]
+    config._env_timeout_method = None  # type: ignore[attr-defined]
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -289,6 +301,16 @@ def _spawn_child_entrypoint(
     os.environ[_CHILD_SENTINEL] = "1"
     os.environ["PYTEST_PARENT_PID"] = str(parent_pid)
 
+    # Capture stdout/stderr so we can ship it back to the parent if
+    # the child crashes — keeps the parent's terminal clean while
+    # preserving diagnostics for when something does go wrong.
+    import io, sys
+    captured_out = io.StringIO()
+    captured_err = io.StringIO()
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    sys.stdout = captured_out
+    sys.stderr = captured_err
+
     try:
         # Move into the rootdir so relative test paths resolve correctly.
         os.chdir(rootdir)
@@ -327,19 +349,33 @@ def _spawn_child_entrypoint(
         # in-process plugin just intercepts reports.
         exit_code = pytest.main(argv, plugins=[collector])
 
-        # If pytest.main exited cleanly with no reports captured, surface
-        # an explicit error so the parent doesn't think the test passed.
-        if not collector.sent_any and exit_code != 0:
-            result_q.put(
-                ("error", f"child pytest.main exited {exit_code} without reports")
+        # If pytest.main exited without producing reports, surface the
+        # captured stdout/stderr so the parent can synthesize a useful
+        # error message instead of "Child exited with code N and no
+        # reports". This catches collection errors, plugin crashes, and
+        # anything else that bypasses the normal report-emit path.
+        if not collector.sent_any:
+            details = (
+                f"child pytest.main exited {exit_code} without reports\n"
+                f"--- captured stdout ---\n{captured_out.getvalue()}\n"
+                f"--- captured stderr ---\n{captured_err.getvalue()}"
             )
+            result_q.put(("error", details))
     except BaseException as exc:  # noqa: BLE001 — must catch everything
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         try:
-            result_q.put(("error", f"child crashed: {tb}"))
+            result_q.put((
+                "error",
+                f"child crashed: {tb}\n"
+                f"--- captured stdout ---\n{captured_out.getvalue()}\n"
+                f"--- captured stderr ---\n{captured_err.getvalue()}",
+            ))
         except Exception:
             # Queue may already be closed if the parent gave up.
             pass
+    finally:
+        sys.stdout = real_stdout
+        sys.stderr = real_stderr
 
 
 class _ReportCollector:
