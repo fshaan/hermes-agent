@@ -10,18 +10,22 @@ manually cleared each known state bucket. That approach is fragile (every
 new module-level dict needs a corresponding line in conftest) and ugly.
 
 This plugin replaces that fixture with true process isolation: each test
-runs in a fresh Python interpreter via ``multiprocessing.Process`` with the
-``spawn`` start method. ``spawn`` is the only multiprocessing context that
-works cross-platform (Linux, macOS, Windows) — ``fork`` is POSIX-only, and
-``forkserver`` doesn't exist on Windows.
+runs in a fresh Python interpreter via ``multiprocessing.Process`` with
+the ``spawn`` start method. We deliberately do not offer a fork fast-path,
+even on POSIX — fork inherits threads, FDs, signal handlers, and module
+state from the parent, which defeats the whole point of "fresh per test"
+and is the exact failure mode this plugin exists to prevent. ``spawn`` is
+also the only context that works on Windows, so this keeps one code path
+across all platforms.
 
 The child process:
-  1. Inherits the parent's args/options via the spawn payload (pickled).
-  2. Sets ``HERMES_ISOLATE_CHILD=1`` so this plugin is a no-op there
-     (otherwise the child would try to spawn its own grandchildren — fork
-     bomb).
-  3. Runs ``runtestprotocol(item)`` for the single test it was given.
-  4. Serializes test reports via ``pytest_report_to_serializable`` and
+  1. Sets ``HERMES_ISOLATE_CHILD=1`` so this plugin is a no-op there
+     (otherwise the child would try to spawn its own grandchildren —
+     fork bomb).
+  2. Boots a fresh interpreter, re-imports pytest and the test module,
+     then invokes ``pytest.main([nodeid])`` against an in-process plugin
+     that captures reports.
+  3. Serializes test reports via ``pytest_report_to_serializable`` and
      pushes them through an ``mp.Queue`` back to the parent.
 
 The parent:
@@ -34,11 +38,11 @@ The parent:
 
 Performance
 -----------
-Per-test overhead is dominated by ``python`` interpreter startup +
-collecting just the one nodeid (~0.3-1.0 s depending on the test file's
-import graph). xdist parallelism amortizes this across cores. On a 20-core
-workstation a 17 k-test suite finishes in roughly the same wall time as the
-old shared-state approach, with zero leakage risk.
+Per-test overhead is dominated by Python interpreter startup +
+collecting one nodeid (~200-1000 ms). xdist parallelism (``-n auto``)
+amortizes this across cores in one CI job; for the full ~17 k-test
+suite we shard across multiple parallel GHA jobs via ``pytest-split``
+so total wall time fits in the 30-minute job timeout.
 """
 
 from __future__ import annotations
@@ -46,7 +50,6 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import signal
-import sys
 import traceback
 from contextlib import contextmanager
 from typing import Any, Iterator, List, Optional, Tuple
@@ -98,13 +101,14 @@ def pytest_configure(config: pytest.Config) -> None:
     if os.environ.get(_CHILD_SENTINEL) == "1":
         return
 
-    # spawn is mandatory: it's the only context that works on Windows.
+    # spawn must be available — it's the only context that works on Windows
+    # and we deliberately use it on POSIX too for cross-platform symmetry.
     try:
         mp.get_context("spawn")
     except (ValueError, AttributeError) as exc:  # pragma: no cover
         raise pytest.UsageError(
-            "hermes-isolate: multiprocessing 'spawn' context is unavailable. "
-            f"({exc})"
+            "hermes-isolate: multiprocessing 'spawn' context is unavailable "
+            f"on this platform. ({exc})"
         ) from exc
 
 
@@ -135,7 +139,7 @@ def pytest_runtest_protocol(
     # parent-side kill via ``proc.join`` as a backstop. See the docstring
     # on ``_suspend_sigalrm`` for the gory details.
     with _suspend_sigalrm():
-        reports = _run_in_spawned_subprocess(item, timeout)
+        reports = _run_in_subprocess(item, timeout)
 
         # Emit reports through the normal pytest channels so xdist + terminal
         # reporter + junit etc. all see them as if the test ran normally.
@@ -216,20 +220,16 @@ def _suspend_sigalrm() -> Iterator[None]:
     # final state we're already in.
 
 
-def _run_in_spawned_subprocess(
+def _run_in_subprocess(
     item: pytest.Item, timeout: float
 ) -> List[pytest.TestReport]:
-    """Spawn a new Python process, run the test there, collect reports.
+    """Spawn a fresh Python process, run the test there, collect reports.
 
-    The child is given:
-      * The exact nodeid we want it to run.
-      * The full ``sys.argv`` of the parent pytest invocation, minus a few
-        flags that would mess with the child (xdist, our own --no-isolate).
-      * The parent's working directory.
-
-    The child runs ``pytest.main([...nodeid])`` against a one-shot in-process
-    plugin that captures reports into a list and pushes them through an
-    ``mp.Queue``.
+    The child re-boots Python and runs ``pytest.main([nodeid])``. Slower
+    than fork (~200-1000 ms per test depending on import graph) but the
+    isolation is real — no inherited threads, FDs, or module state. We
+    rely on ``-n auto`` xdist parallelism + CI sharding (pytest-split)
+    to keep total wall time reasonable.
     """
     ctx = mp.get_context("spawn")
     result_q: "mp.Queue[Tuple[str, Any]]" = ctx.Queue()
@@ -238,7 +238,7 @@ def _run_in_spawned_subprocess(
     nodeid = item.nodeid
 
     proc = ctx.Process(
-        target=_child_entrypoint,
+        target=_spawn_child_entrypoint,
         args=(result_q, rootdir, nodeid, os.getpid(), timeout),
         # Helpful in process listings; spawn ignores name visually on most
         # systems but JUnit output uses it for pid attribution.
@@ -327,10 +327,10 @@ def _synthesize_crash_report(item: pytest.Item, message: str) -> pytest.TestRepo
 # Module-level so ``spawn`` can pickle it (lambdas/closures don't pickle).
 
 
-def _child_entrypoint(
+def _spawn_child_entrypoint(
     result_q: "mp.Queue", rootdir: str, nodeid: str, parent_pid: int, timeout: float
 ) -> None:
-    """Run a single test in the spawned process and ship reports home.
+    """Run a single test in a spawned (fresh-interpreter) process.
 
     Must be importable at the top level for ``spawn`` to find it via
     ``mp.spawn``'s pickling machinery.

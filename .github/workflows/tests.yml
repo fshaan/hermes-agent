@@ -23,7 +23,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -55,9 +55,21 @@ jobs:
           uv pip install -e ".[all,dev]"
 
       - name: Run tests
+        # Architecture:
+        #   * One job per platform (this one is Linux).
+        #   * xdist (-n auto) schedules tests in parallel across N worker
+        #     processes (N = CPU count on the runner).
+        #   * Each xdist worker delegates the actual test execution to a
+        #     fresh subprocess via tests/_isolate_plugin.py (spawn start
+        #     method). This guarantees no module-level state leaks
+        #     between tests on the same worker.
+        # If this overruns the 60-minute timeout, the fix is either a
+        # bigger runner (ubuntu-latest-{8,16}-cores) or splitting hot test
+        # modules — NOT switching to fork.
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto --timeout=30 --timeout-method=signal
+          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short \
+            -n auto --timeout=30 --timeout-method=signal
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
